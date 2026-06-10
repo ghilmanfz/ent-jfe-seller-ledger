@@ -1,6 +1,6 @@
 # Seller Ledger — Event-Sourced Order & Payments System
 
-**Submission: Ent-JFE-20/05/26 (Junior Fullstack Engineer)**
+**Submission: Ent-JFE (Junior Fullstack Engineer)**
 
 A seller takes ~1,000 orders/day. This system records every order **immutably**, processes payments
 (mocked Stripe), charges a 3% fee, prevents double payments, supports refunds, runs daily
