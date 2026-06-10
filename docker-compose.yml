@@ -1,0 +1,22 @@
+# Convenience for reviewers: local PostgreSQL matching backend/.env defaults.
+#   docker compose up -d
+# Then in backend/: npm run db:migrate && npm run db:seed
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - '5433:5432'
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ent_jfe
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
