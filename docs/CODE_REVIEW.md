@@ -1,6 +1,6 @@
 # Part D — Code Review
 
-The snippet under review (reformatted, otherwise verbatim):
+Here's the `recordPayment` we were asked to review (reformatted, otherwise as given):
 
 ```js
 async recordPayment(orderId, amount, idempotencyKey) {
@@ -27,110 +27,104 @@ async recordPayment(orderId, amount, idempotencyKey) {
 }
 ```
 
-## Findings
+I read it as "charge the card, then remember we did it." For code that moves real money that's a
+lot of trust in a happy path that won't always happen. I went through it line by line; below are
+the problems, starting with the ones that actually cost money.
 
-### 1. 🔴 TOCTOU race → double charge (race condition)
+## The ones that lose money
 
-The "already paid" check reads `payment_received` at time T₀, but the charge and the write happen
-much later, with `await`s in between and **no transaction or version guard anywhere**. Two
-concurrent calls (double-click, two pods, a retry racing the original) both read
-`payment_received = 0`, both pass the check, **both call `stripeAPI.charge`** — the customer pays
-twice. The check-then-act must be made atomic; a unique constraint on
-`(aggregateId, version)` (or equivalently a guarded conditional write) is the fix, not the
-in-memory `if`.
+**1. Two requests can charge the same card twice.**
+The guard on line 2 reads `payment_received`, but the charge on line 13 happens a few `await`s
+later and nothing holds a lock in between. So two requests arriving close together (a double-click,
+a retry that races the original, two instances behind a load balancer) both read `0`, both pass
+the check, and both call `stripeAPI.charge`. The customer pays twice. This is a check-then-act
+(TOCTOU) race, and you can't close it with an `if` in memory. The database has to be the one that
+says "only one of you wins" — in my version that's a unique constraint on `(aggregateId, version)`.
 
-### 2. 🔴 Charge happens before any durable record (money moves, no evidence)
+**2. It charges before it writes anything down.**
+`stripeAPI.charge` runs before any event exists. If the process dies right after the charge
+(crash, out-of-memory, a deploy restart), the money already left the customer's card and there is
+no record of it anywhere. For a system whose whole job is to never lose track of money, that's the
+worst possible failure. The order should be: write down that we're *about* to pay, charge, then
+write down that we paid — and every step has to be safe to run again.
 
-`stripeAPI.charge` runs **before** the event is persisted. If the process crashes, the DB write
-fails, or the pod is OOM-killed right after the charge, money moved and the system has **zero
-record of it** — the exact failure an event-sourced payment system exists to prevent. Record
-intent first (a `PaymentProcessing` event), then charge, then confirm. Every step must be
-idempotent so a retry completes the half-done flow instead of repeating it.
+**3. Stripe never gets an idempotency key.**
+Say our own DB does dedupe events later. The charge still isn't protected: if the network drops
+between `charge()` and `create()`, the retry calls `charge()` again, and nothing tells Stripe
+"this is the same payment as before." Second charge. The real Stripe API takes an `Idempotency-Key`
+header for exactly this case, and it should be derived from the key we already have. (In my
+implementation the mock's `chargeId` is just a hash of that key, so the same key can't produce two
+charges.)
 
-### 3. 🔴 No idempotency key passed to Stripe (idempotency bug, provider side)
+## The ones that corrupt the books
 
-Even when our own DB dedupes the event, the **charge itself** isn't deduplicated: a network
-timeout between `charge()` and `create()` leads to a retry that calls `charge()` again with no
-idempotency key — second charge, first one orphaned. Stripe accepts an `Idempotency-Key` for
-precisely this; it must be derived from ours (in this codebase the mock's `chargeId` is a pure
-function of the key, making a duplicate charge structurally impossible).
+**4. It never writes to the ledger.**
+The task is built around double-entry bookkeeping, and this function records a payment by writing
+a number into a column. No debit, no credit. So `verifyLedgerBalance` has nothing to verify, and
+there's no audit trail at all — the `payment_received` value is just a number you have to take on
+faith. A payment should append a balanced debit/credit pair (here: debit `payment_received`,
+credit `order_balance`) in the same transaction as the event.
 
-### 4. 🔴 No ledger postings at all (ledger imbalance)
+**5. The event and the order update are two separate writes.**
+`financialEvent.create` and `order.update` aren't in a transaction. Crash between them and you get
+a "PaymentConfirmed" event sitting next to an order row that still says it's unpaid. Everything
+that belongs to one payment — the event, the ledger rows, the read model — needs to commit
+together or not at all.
 
-The function mutates a cached `payment_received` column and writes **no debit/credit rows**.
-There is no `DEBIT payment_received / CREDIT order_balance` pair, so the books don't record the
-movement: `verifyLedgerBalance` can't pass, audits have nothing to audit, and the "balance" is
-just an unverifiable integer. Every financial event must append a balanced posting set **in the
-same transaction as the event**.
+**6. The version comes from a stale read.**
+`order.version + 1` uses the row fetched back on line 1. By the time we insert, someone else may
+already have taken that version number. With no unique constraint, you end up with two events at
+the same version and the stream is no longer replayable. Add the constraint but forget to handle
+its error, and the request blows up with a 500 *after* the card was charged. The fix is to read the
+current version inside the transaction, insert N+1, and turn the unique-violation into a clean
+`409` the caller can understand.
 
-### 5. 🔴 Event and order update are separate writes (atomicity / consistency)
+**7. The amount is a float.**
+`amount` shows up as a plain JS number and goes straight into the payload and the column. `0.1 +
+0.2` isn't `0.3`, cents drift, and once it's serialized into JSON it's stuck as a float. On top of
+that the function never checks `amount` against what the order actually costs, so it'll happily
+charge an overpayment, an underpayment, or a negative number. Money should travel as a decimal
+string and live in the DB as `Decimal(18,4)`.
 
-`financialEvent.create` and `order.update` are two independent statements. A crash between them
-leaves a confirmed-payment event with a read model that still says unpaid (or, with finding 2,
-any other combination). All writes belonging to one event — event row, postings, projection —
-must commit or roll back **together**.
+## Smaller, but still wrong
 
-### 6. 🟠 Version computed from a stale read, with no uniqueness to back it (lost update)
+**8. `payment_received > 0` is pretending to be a state machine.**
+Using a number as state lets through things that should be impossible. A refund might set the
+column back to `0`, which makes a refunded order look payable again. You can also "pay" an order
+that was never finished being created. There's no explicit status and no list of allowed moves.
+Payment should only be allowed from a real state like `CREATED` or `PAYMENT_PROCESSING`.
 
-`version: order.version + 1` uses the `order` row fetched at the top — by write time another
-event may have taken that version. Without `UNIQUE(aggregateId, version)` two events get the
-**same version** (stream corrupted, replay ambiguous); with the constraint but no error handling
-the request dies as an unhandled 500 *after the customer was charged* (finding 2 compounds it).
-Correct: read the latest event version inside the transaction, insert N+1, and translate the
-unique violation into an explicit `409 VERSION_CONFLICT`.
+**9. The idempotent replay is in the wrong place and incomplete.**
+Two issues here. First, the `existing` lookup sits *after* the "already paid" check, so a genuine
+retry of a payment that already went through hits `throw new Error('Already paid')` and gets an
+error instead of its own result — the key lookup has to come first. Second, even when it does
+return `existing`, that's only correct if the original operation finished. If the first attempt
+died after `create()` but before `order.update()`, the retry returns the event and the order is
+never updated. A safe replay has to give back the result of a *completed* operation, and it should
+reject the same key used with a different amount instead of quietly returning the old one.
 
-### 7. 🟠 Idempotent replay returns the event but skips the side effects (idempotency bug, local side)
+**10. No null check, no error types, and it overwrites instead of appends.**
+If `orderId` is wrong, `order` is `null` and `order.payment_received` throws a TypeError 500 where
+a 404 would be honest. A declined card and a temporary Stripe outage come back looking the same, so
+the caller can't tell whether retrying is safe. And `data: { payment_received: amount }` overwrites
+the column, so a second (buggy) call silently wipes the first value — in an append-only system you
+add an event and derive the number, you don't overwrite it.
 
-The `existing` early-return happens **after** money checks but is also subtly wrong on its own:
-if the first attempt crashed after `create()` but before `order.update()` (finding 5), the retry
-returns `existing` immediately and the order row is **never** updated. A correct replay must
-return the stored *outcome* of a *completed* operation — which is only possible when the
-operation is atomic (finding 5) and the replay validates the request matches the stored payload
-(same key + different amount must be `422`, not a silent wrong answer).
+## What I did instead
 
-Ordering is also broken: a legitimate retry of the request that *did* pay the order hits
-`'Already paid'` (line 2) before the idempotency lookup (line 3) and gets an **error instead of
-its own result**. The key lookup must come first.
+The version I shipped is [`recordPayment`](../backend/src/services/financial-service.ts) plus the
+[`processOrderPayment`](../backend/src/services/financial-service.ts) wrapper around it. Short
+version of how it avoids the above:
 
-### 8. 🟠 `payment_received > 0` is not a state machine (state machine violation)
+- It looks up the idempotency key first, and if the key was reused with a different amount it
+  returns `422` instead of the wrong result.
+- The event, the ledger pair, and the projection update all happen in one transaction. It reads
+  the latest version inside that transaction, inserts N+1, and lets the unique constraints on the
+  key and on `(aggregateId, version)` be the real gate — a lost race comes back as `409`.
+- The Stripe call sits outside the DB transaction but inside the saga: a `PaymentProcessing` event
+  before it, `PaymentConfirmed` + fees after it, and a key derived per step, so a retry picks up
+  where it left off instead of charging again.
+- A decline is recorded as `PaymentFailed` and returns `402`; a transient Stripe error returns
+  `502` and resuming with the same key is safe.
 
-A numeric column as implicit state accepts nonsense: paying a `CANCELLED`/`REFUNDED` order
-(refund could set the column back to 0 — making the order *payable again*), paying before
-creation completes, etc. There is no explicit status, no allowed-transition table, no terminal
-states. Payment must be validated against an explicit state machine
-(`PaymentConfirmed` allowed from `CREATED`/`PAYMENT_PROCESSING` only).
-
-### 9. 🟠 `amount` as a float, compared and stored raw (precision error)
-
-`amount` arrives as a JS `number` and goes straight into the payload and the column:
-`0.1 + 0.2 !== 0.3`, `1000.45 * 100` ≠ integer cents, JSON serialization of the payload stores a
-float forever. Comparisons like `> 0` and equality checks on floats are unreliable. Money must be
-a decimal string on the wire, `Decimal(18,4)` in storage, and exact-decimal arithmetic in between.
-The function also never validates `amount` against the order's amount — it charges and records
-**whatever the caller sent** (overpay/underpay/negative all accepted).
-
-### 10. 🟡 No error typing, no null check, mutable overwrite
-
-`order` may be `null` → `order.payment_received` throws a `TypeError` 500 instead of a 404.
-`stripeAPI.charge` failures (declines vs transient outages) are undifferentiated, so clients
-can't know whether retrying is safe. And `data: { payment_received: amount }` **overwrites**
-rather than records — a second (buggy) write silently erases the first; immutable systems append
-events and derive state.
-
-## Corrected shape
-
-The fixed version is this repository's
-[`recordPayment`](../backend/src/services/financial-service.ts) plus the saga wrapper
-[`processOrderPayment`](../backend/src/services/financial-service.ts):
-
-1. idempotency lookup **first**, with intent matching (`422` on parameter mismatch);
-2. inside **one transaction**: load order (404 if missing) → state machine check → amount must
-   equal the order's amount → read latest version → `INSERT` event at `N+1` (unique constraints
-   on key and version as the real gate) → balanced postings → guarded projection update;
-3. the charge happens *outside* the DB transaction but *inside* the saga: intent event before it,
-   confirmation after it, an idempotency key derived per step, and a deterministic provider key —
-   so any retry resumes instead of repeating;
-4. unique-violation → `409 VERSION_CONFLICT`; decline → recorded `PaymentFailed` + `402`;
-   transient provider error → `502` and the same key resumes.
-
-Every finding above maps to a test in `backend/tests/` that fails if the protection is removed.
+Each of these has a test in `backend/tests/` that fails if I take the protection back out.

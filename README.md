@@ -9,8 +9,8 @@ trail good enough to replay any day and know exactly what happened.
 
 | Deliverable | URL |
 | --- | --- |
-| Frontend (Vercel) | _fill in after deploy_ |
-| Backend API (Railway) | _fill in after deploy_ |
+| Frontend (Vercel) | https://ent-jfe-seller-ledger.vercel.app |
+| Backend API (Railway) | https://ent-jfe-seller-ledger-production.up.railway.app |
 | Database | Supabase (PostgreSQL) |
 
 > Deployment steps: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
