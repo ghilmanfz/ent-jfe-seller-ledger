@@ -1,0 +1,22 @@
+# dependencies / build output
+node_modules/
+dist/
+.next/
+out/
+*.tsbuildinfo
+
+# environment (examples are tracked: .env.example)
+.env
+.env.test
+.env.local
+.env*.local
+
+# local-only working notes & tooling (not part of the submission)
+.local/
+.claude/
+
+# misc
+npm-debug.log*
+yarn-error.log
+.DS_Store
+Thumbs.db

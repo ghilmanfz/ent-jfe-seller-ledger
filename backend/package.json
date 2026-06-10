@@ -1,0 +1,42 @@
+{
+  "name": "ent-jfe-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Event-sourced order & payments ledger API (Ent-JFE-20/05/26)",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "prisma generate && tsc -p tsconfig.build.json",
+    "start": "node dist/src/server.js",
+    "start:deploy": "prisma migrate deploy && node dist/src/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "jest --runInBand",
+    "test:watch": "jest --runInBand --watch",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "tsx scripts/seed.ts",
+    "db:replay": "tsx scripts/rebuild-projections.ts",
+    "load-test": "tsx scripts/load-test.ts"
+  },
+  "prisma": {
+    "seed": "tsx scripts/seed.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@prisma/client": "^6.8.2",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.3.2",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.10.2",
+    "jest": "^29.7.0",
+    "prisma": "^6.8.2",
+    "ts-jest": "^29.2.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
